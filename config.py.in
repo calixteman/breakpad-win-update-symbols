@@ -1,7 +1,0 @@
-# URL pointing to the daily module report file in CSV format
-# %(date)s will be substituted with the date as YYYYMMDD
-csv_url='https://crash-analysis.mozilla.com/crash_analysis/%(date)s/%(date)s-missing-symbols.txt'
-# Command to execute for dump_syms
-dump_syms_cmd = ['wine64', 'dump_syms']
-# Authentication token for Socorro's upload API
-auth_token=''

@@ -1,2 +1,0 @@
-csv_url='https://crash-analysis.mozilla.com/crash_analysis/%(date)s/%(date)s-missing-symbols.txt'
-dump_syms_cmd = ['/opt/wine-staging/bin/wine64', '/home/user/dump_syms/dump_syms.exe']

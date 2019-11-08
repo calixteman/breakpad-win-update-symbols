@@ -24,345 +24,468 @@
 # The script also depends on having write access to the directory it is
 # installed in, to write the skiplist text file.
 
+from aiofile import AIOFile, LineReader
+from aiohttp import ClientSession, ClientTimeout
+from aiohttp.connector import TCPConnector
 import argparse
-import config
+import asyncio
 import sys
 import os
-import datetime
-import subprocess
 import shutil
+import time
 import logging
 from collections import defaultdict
 from tempfile import mkdtemp
-import urllib
-import urlparse
+from urllib.parse import urljoin
+from urllib.parse import quote
 import zipfile
-import requests
+
 
 # Just hardcoded here
-MICROSOFT_SYMBOL_SERVER = 'http://msdl.microsoft.com/download/symbols/'
-USER_AGENT = 'Microsoft-Symbol-Server/6.3.0.0'
-MOZILLA_SYMBOL_SERVER = ('https://s3-us-west-2.amazonaws.com/'
-                         'org.mozilla.crash-stats.symbols-public/v1/')
-MISSING_SYMBOLS_URL = 'https://symbols.mozilla.org/missingsymbols.csv?microsoft=only'
+MICROSOFT_SYMBOL_SERVER = "https://msdl.microsoft.com/download/symbols/"
+USER_AGENT = "Microsoft-Symbol-Server/6.3.0.0"
+MOZILLA_SYMBOL_SERVER = (
+    "https://s3-us-west-2.amazonaws.com/org.mozilla.crash-stats.symbols-public/v1/"
+)
+MISSING_SYMBOLS_URL = "https://symbols.mozilla.org/missingsymbols.csv?microsoft=only"
+HEADERS = {"User-Agent": USER_AGENT}
+SYM_SRV = "SRV*{}*https://msdl.microsoft.com/download/symbols"
+TIMEOUT = 7200
 
 thisdir = os.path.dirname(__file__)
 log = logging.getLogger()
 
 
-class Win64ProcessError(Exception):
-    pass
+def get_type(data):
+    # PDB v7
+    if data.startswith(b"Microsoft C/C++ MSF 7.00"):
+        return "pdb-v7"
+    # PDB v2
+    if data.startswith(b"Microsoft C/C++ program database 2.00"):
+        return "pdb-v2"
+    # DLL
+    if data.startswith(b"MZ"):
+        return "dll"
+    # CAB
+    if data.startswith(b"MSCF"):
+        return "cab"
+
+    return "unknown"
 
 
-# Don't run continuously for more than 2 hours.
-MAX_RUNTIME_SECS = 7200
+async def server_has_file(client, server, filename):
+    """
+    Send the symbol server a HEAD request to see if it has this symbol file.
+    """
+    url = urljoin(server, quote(filename))
+    for _ in range(10):
+        try:
+            async with client.head(url, headers=HEADERS, allow_redirects=True) as resp:
+                if resp.status == 200 and (
+                    (
+                        "microsoft" in server
+                        and resp.headers["Content-Type"] == "application/octet-stream"
+                    )
+                    or "mozilla" in server
+                ):
+                    log.debug(f"File exists: {url}")
+                    return True
+                else:
+                    return False
+        except Exception as e:
+            log.debug(f"Error with {url}: retry")
+            log.exception(e)
+            await asyncio.sleep(0.5)
+
+    log.debug(f"Too much retries (HEAD) for {url}: give up.")
+    return False
 
 
-def timed_out(start):
-    return (datetime.datetime.now() - start).total_seconds() > MAX_RUNTIME_SECS
+async def fetch_file(client, server, filename):
+    """
+    Fetch the file from the server
+    """
+    url = urljoin(server, quote(filename))
+    log.debug(f"Fetch url: {url}")
+    for _ in range(10):
+        try:
+            async with client.get(url, headers=HEADERS, allow_redirects=True) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    typ = get_type(data)
+                    if typ == "unknown":
+                        # try again
+                        await asyncio.sleep(0.5)
+                    elif typ == "pdb-v2":
+                        # too old: skip it
+                        log.debug(f"PDB v2 (skipped because too old): {url}")
+                        return None
+                    else:
+                        return data
+                else:
+                    log.error(f"Cannot get data (status {resp.status}) for {url}: ")
+        except Exception as e:
+            log.debug(f"Error with {url}")
+            log.exception(e)
+            await asyncio.sleep(0.5)
 
-
-def fetch_symbol(debug_id, debug_file):
-    '''
-    Attempt to fetch a PDB file from Microsoft's symbol server.
-    '''
-    # TODO: figure out how to request compressed symbols nowadays.
-    url = urlparse.urljoin(MICROSOFT_SYMBOL_SERVER,
-                           os.path.join(debug_file,
-                                        debug_id,
-                                        debug_file))
-    try:
-        r = requests.get(url,
-                         headers={'User-Agent': USER_AGENT})
-        if r.status_code == 200:
-            return r.content
-    except requests.exceptions.RequestException as e:
-        log.warn('Error fetching symbol file "%s/%s": %s' % (debug_id, debug_file, str(e)))
+    log.debug(f"Too much retries (GET) for {url}: give up.")
     return None
 
 
-def fetch_symbol_and_decompress(tmpdir, debug_id, debug_file):
-    '''
-    Attempt to fetch a PDB file from Microsoft's symbol server, then
-    write a decompressed version to tmpdir.
-    Returns the filename if successful, or None if unsuccessful.
-    '''
-    data = fetch_symbol(debug_id, debug_file)
-    if not data:
-        return None
-    # Check for PDB/PE signature.
-    if data.startswith(b'Microsoft C/C++ MSF 7.00') or data.startswith(b'MZ'):
-        # Uncompressed file, just write it out and return it.
-        path = os.path.join(tmpdir, debug_file.lower())
-        with open(path, 'wb') as f:
-            f.write(data)
-        return path
-    if not data.startswith(b'MSCF'):
-        # Not a cabinet file.
-        return None
-    path = os.path.join(tmpdir, debug_file[:-1] + '_')
-    with open(path, 'wb') as f:
-        f.write(data)
-    try:
-        # Decompress it
-        subprocess.check_call(['cabextract', '-L', '-d', tmpdir, path],
-                              stdout=open(os.devnull, 'wb'))
-        os.unlink(path)
-        return os.path.join(tmpdir, debug_file.lower())
-    except subprocess.CalledProcessError:
-        return None
+def write_skiplist(skiplist):
+    with open(os.path.join(thisdir, "skiplist.txt"), "w") as sf:
+        for (debug_id, debug_file) in skiplist.items():
+            sf.write("%s %s\n" % (debug_id, debug_file))
 
 
-def fetch_and_dump_symbols(tmpdir, debug_id, debug_file,
-                           code_id=None, code_file=None):
-    pdb_path = fetch_symbol_and_decompress(tmpdir, debug_id, debug_file)
-    if pdb_path is None:
-        return None
-    bin_path = None
-    while True:
-        try:
-            # Dump it
-            syms = subprocess.check_output(config.dump_syms_cmd + [pdb_path])
-            lines = syms.splitlines()
-            if not lines:
-                return None
-            os.unlink(pdb_path)
-            if bin_path:
-                os.unlink(bin_path)
-            return syms
-        except subprocess.CalledProcessError as e:
-            lines = e.output.splitlines()
-            bits = lines[0].split() if len(lines) > 0 else []
-            cpu = bits[2] if len(bits) > 2 else ''
-            if bin_path is None and cpu == 'x86_64':
-                # Can't dump useful symbols for Win64 PDBs without binaries.
-                if code_id and code_file:
-                    log.debug('Fetching binary %s, %s', code_id, code_file)
-                    bin_path = fetch_symbol_and_decompress(tmpdir, code_id, code_file)
-                    if bin_path:
-                        log.debug('Fetched binary %s', bin_path)
-                    else:
-                        log.warn("Couldn't fetch binary for %s, %s",
-                                 code_id, code_file)
-                        raise Win64ProcessError()
+async def fetch_missing_symbols(u):
+    log.info("Trying missing symbols from %s" % u)
+    async with ClientSession() as client:
+        async with client.get(u, headers=HEADERS) as resp:
+            # just skip the first line since it contains column headers
+            data = await resp.text()
+            return data.splitlines()[1:]
+
+
+async def get_list(filename, info):
+    alist = set()
+    path = os.path.join(thisdir, filename)
+    if os.path.exists(path):
+        async with AIOFile(os.path.join(thisdir, filename), "r") as In:
+            async for line in LineReader(In):
+                line = line.rstrip()
+                alist.add(line)
+    log.debug(f"{info} contains {len(alist)} items")
+
+    return alist
+
+
+async def get_skiplist():
+    skiplist = {}
+    skipcount = 0
+    path = os.path.join(thisdir, "skiplist.txt")
+    if os.path.exists(path):
+        async with AIOFile(path, "r") as In:
+            async for line in LineReader(In):
+                line = line.strip()
+                if line == "":
                     continue
-                else:
-                    raise Win64ProcessError()
-            return None
+                s = line.split(None, 1)
+                if len(s) != 2:
+                    continue
+                debug_id, debug_file = s
+                skiplist[debug_id] = debug_file.lower()
+                skipcount += 1
+    log.debug(f"Skiplist contains {skipcount} items")
+
+    return skiplist
 
 
-def server_has_file(filename):
-    '''
-    Send the symbol server a HEAD request to see if it has this symbol file.
-    '''
-    try:
-        r = requests.head(
-            urlparse.urljoin(
-                MOZILLA_SYMBOL_SERVER,
-                urllib.quote(filename)))
-        return r.status_code == 200
-    except requests.exceptions.RequestException:
+def get_missing_symbols(missing_symbols, skiplist, blacklist):
+    modules = defaultdict(set)
+    stats = {"blacklist": 0, "skiplist": 0}
+    for line in missing_symbols:
+        line = line.rstrip()
+        bits = line.split(",")
+        if len(bits) < 2:
+            continue
+        pdb, debug_id = bits[:2]
+        code_file, code_id = None, None
+        if len(bits) >= 4:
+            code_file, code_id = bits[2:4]
+        if pdb and debug_id and pdb.endswith(".pdb"):
+            if pdb.lower() in blacklist:
+                stats["blacklist"] += 1
+                continue
+
+            if skiplist.get(debug_id) != pdb.lower():
+                modules[pdb].add((debug_id, code_file, code_id))
+            else:
+                stats["skiplist"] += 1
+                # We've asked the symbol server previously about this,
+                # so skip it.
+                log.debug("%s/%s already in skiplist", pdb, debug_id)
+
+    return modules, stats
+
+
+async def collect_info(client, filename, debug_id, code_file, code_id):
+    pdb_path = os.path.join(filename, debug_id, filename)
+    sym_path = os.path.join(filename, debug_id, filename.replace(".pdb", "") + ".sym")
+
+    has_pdb = await server_has_file(client, MICROSOFT_SYMBOL_SERVER, pdb_path)
+    has_code = is_there = False
+    if has_pdb and not await server_has_file(client, MOZILLA_SYMBOL_SERVER, sym_path):
+        has_code = await server_has_file(
+            client, MICROSOFT_SYMBOL_SERVER, f"{code_file}/{code_id}/{code_file}"
+        )
+    elif has_pdb:
+        # if the file is on moz sym server no need to do anything
+        is_there = True
+        has_pdb = False
+
+    return (filename, debug_id, code_file, code_id, has_pdb, has_code, is_there)
+
+
+async def check_x86_file(path):
+    async with AIOFile(path, "rb") as In:
+        chunk = await In.read(32)
+        if chunk.startswith(b"MODULE windows x86 "):
+            return True
+    return False
+
+
+async def run_command(cmd):
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _, err = await proc.communicate()
+    err = err.decode().strip()
+
+    return err
+
+
+async def dump_module(
+    output, symcache, filename, debug_id, code_file, code_id, has_code, dump_syms
+):
+    sym_path = os.path.join(filename, debug_id, filename.replace(".pdb", "") + ".sym")
+    output_path = os.path.join(output, sym_path)
+    sym_srv = SYM_SRV.format(symcache)
+
+    if has_code:
+        cmd = f"{dump_syms} {code_file} --code-id {code_id} --store {output} --symbol-server '{sym_srv}' --verbose error"
+    else:
+        cmd = f"{dump_syms} {filename} --debug-id {debug_id} --store {output} --symbol-server '{sym_srv}' --verbose error"
+
+    err = await run_command(cmd)
+
+    if err:
+        log.error(f"Error with {cmd}")
+        log.error(err)
+        return 1
+
+    if not has_code and not await check_x86_file(output_path):
+        log.debug(f"x86_64 binary {code_file}/{code_id} required")
+        return 2
+
+    log.info(f"Successfully dumped: {filename}/{debug_id}")
+    return sym_path
+
+
+async def dump_helper(output, symcache, modules, dump_syms):
+    tasks = []
+    for filename, debug_id, code_file, code_id, has_code in modules:
+        tasks.append(
+            dump_module(
+                output,
+                symcache,
+                filename,
+                debug_id,
+                code_file,
+                code_id,
+                has_code,
+                dump_syms,
+            )
+        )
+
+    return await asyncio.gather(*tasks)
+
+
+def dump(output, symcache, modules, dump_syms):
+    res = asyncio.run(dump_helper(output, symcache, modules, dump_syms))
+    file_index = {x for x in res if isinstance(x, str)}
+    stats = {
+        "dump_error": sum(1 for x in res if x == 1),
+        "no_bin": sum(1 for x in res if x == 2),
+    }
+
+    return file_index, stats
+
+
+async def collect_helper(modules):
+    loop = asyncio.get_event_loop()
+    tasks = []
+    connector = TCPConnector(limit=100, limit_per_host=20)
+    async with ClientSession(
+        loop=loop, timeout=ClientTimeout(total=TIMEOUT), connector=connector
+    ) as client:
+        for filename, ids in modules.items():
+            for debug_id, code_file, code_id in ids:
+                tasks.append(
+                    collect_info(client, filename, debug_id, code_file, code_id)
+                )
+
+        return await asyncio.gather(*tasks)
+
+
+def collect(modules):
+    res = asyncio.run(collect_helper(modules))
+    to_dump = []
+    stats = {"no_pdb": 0, "is_there": 0}
+    for filename, debug_id, code_file, code_id, has_pdb, has_code, is_there in res:
+        if not has_pdb:
+            if is_there:
+                stats["is_there"] += 1
+            else:
+                stats["no_pdb"] += 1
+                log.info(f"No pdb for {filename}/{debug_id}")
+            continue
+
+        log.info(
+            f"To dump: {filename}/{debug_id}, {code_file}/{code_id} and has_code = {has_code}"
+        )
+        to_dump.append((filename, debug_id, code_file, code_id, has_code))
+
+    log.info(f"Collected {len(to_dump)} files to dump")
+
+    return to_dump, stats
+
+
+async def fetch_and_write(output, client, filename, file_id):
+    path = os.path.join(filename, file_id, filename)
+    data = await fetch_file(client, MICROSOFT_SYMBOL_SERVER, path)
+
+    if not data:
         return False
 
+    output_dir = os.path.join(output, filename, file_id)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-def write_skiplist(skiplist):
-    try:
-        with open(os.path.join(thisdir, 'skiplist.txt'), 'w') as sf:
-            for (debug_id, debug_file) in skiplist.iteritems():
-                sf.write('%s %s\n' % (debug_id, debug_file))
-    except IOError:
-        log.exception('Error writing skiplist.txt')
+    output_path = os.path.join(output_dir, filename)
+    async with AIOFile(output_path, "wb") as Out:
+        await Out.write(data)
+
+    return True
 
 
-def fetch_missing_symbols(u):
-    log.info('Trying missing symbols from %s' % u)
-    r = requests.get(u)
-    r.raise_for_status()
-    return r.text
+async def fetch_all_helper(output, modules):
+    loop = asyncio.get_event_loop()
+    tasks = []
+    connector = TCPConnector(limit=100, limit_per_host=20)
+    async with ClientSession(
+        loop=loop, timeout=ClientTimeout(total=TIMEOUT), connector=connector
+    ) as client:
+        for filename, debug_id, code_file, code_id, has_code in modules:
+            tasks.append(fetch_and_write(output, client, filename, debug_id))
+            if has_code:
+                tasks.append(fetch_and_write(output, client, code_file, code_id))
+
+        return await asyncio.gather(*tasks)
+
+
+def fetch_all(output, modules):
+    res = asyncio.run(fetch_all_helper(output, modules))
+    res = iter(res)
+    fetched_modules = []
+    for filename, debug_id, code_file, code_id, has_code in modules:
+        fetched_pdb = next(res)
+        if has_code:
+            has_code = next(res)
+        if fetched_pdb:
+            fetched_modules.append((filename, debug_id, code_file, code_id, has_code))
+    return fetched_modules
+
+
+def get_base_data(url):
+    async def helper(url):
+        return await asyncio.gather(
+            fetch_missing_symbols(url),
+            # Symbols that we know belong to us, so don't ask Microsoft for them.
+            get_list("blacklist.txt", "Blacklist"),
+            # Symbols that we know belong to Microsoft, so don't skiplist them.
+            get_list("known-microsoft-symbols.txt", "Known Microsoft symbols"),
+            # Symbols that we've asked for in the past unsuccessfully
+            get_skiplist(),
+        )
+
+    return asyncio.run(helper(url))
+
+
+def gen_zip(output, output_dir, file_index):
+    if not file_index:
+        return
+
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in file_index:
+            z.write(os.path.join(output_dir, f), f)
+    log.info(f"Wrote zip as {output}")
+
+
+def retry_run(cmd, *arg):
+    for _ in range(5):
+        try:
+            return cmd(*arg)
+        except OSError as e:
+            # Sometimes for any reasons we've "Too much open files"
+            # So wait and try again
+            log.exception(e)
+            time.sleep(10)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Fetch missing symbols from Microsoft symbol server')
-    parser.add_argument('--missing-symbols', type=str, help='missing symbols URL',
-                        default=MISSING_SYMBOLS_URL)
-    parser.add_argument('zip', type=str, help='output zip file')
+        description="Fetch missing symbols from Microsoft symbol server"
+    )
+    parser.add_argument(
+        "--missing-symbols",
+        type=str,
+        help="missing symbols URL",
+        default=MISSING_SYMBOLS_URL,
+    )
+    parser.add_argument("zip", type=str, help="output zip file")
+    parser.add_argument(
+        "--dump-syms",
+        type=str,
+        help="dump_syms path",
+        default=os.environ.get("DUMP_SYMS_PATH"),
+    )
+
     args = parser.parse_args()
 
-    start = datetime.datetime.now()
-    verbose = True
+    assert bool(args.dump_syms), "dump_syms path is empty"
 
     logging.basicConfig(level=logging.DEBUG)
-    urllib3_logger = logging.getLogger('urllib3')
-    urllib3_logger.setLevel(logging.ERROR)
-    # formatter = logging.Formatter(fmt='%(asctime)-15s %(message)s',
-    #                               datefmt='%Y-%m-%d %H:%M:%S')
-    log.info('Started')
+    aiohttp_logger = logging.getLogger("aiohttp.client")
+    aiohttp_logger.setLevel(logging.DEBUG)
+    log.info("Started")
 
-    # Symbols that we know belong to us, so don't ask Microsoft for them.
-    try:
-        blacklist = set(
-            l.rstrip() for l in open(
-                os.path.join(
-                    thisdir,
-                    'blacklist.txt'),
-                'r').readlines())
-    except IOError:
-        blacklist = set()
-    log.debug('Blacklist contains %d items' % len(blacklist))
+    missing_symbols, blacklist, known_ms_symbols, skiplist = get_base_data(
+        args.missing_symbols
+    )
 
-    # TODO: rework these as taskcluster artifacts?
-    # Symbols that we know belong to Microsoft, so don't skiplist them.
-    try:
-        known_ms_symbols = set(
-            l.rstrip() for l in open(
-                os.path.join(
-                    thisdir,
-                    'known-microsoft-symbols.txt'),
-                'r').readlines())
-    except IOError:
-        known_ms_symbols = set()
-    log.debug('Known Microsoft symbols contains %d items'
-              % len(known_ms_symbols))
+    modules, stats_skipped = get_missing_symbols(missing_symbols, skiplist, blacklist)
+    total = len(modules) + stats_skipped["blacklist"] + stats_skipped["skiplist"]
 
-    # Symbols that we've asked for in the past unsuccessfully
-    skiplist = {}
-    skipcount = 0
-    try:
-        sf = file(os.path.join(thisdir, 'skiplist.txt'), 'r')
-        for line in sf:
-            line = line.strip()
-            if line == '':
-                continue
-            s = line.split(None, 1)
-            if len(s) != 2:
-                continue
-            (debug_id, debug_file) = s
-            skiplist[debug_id] = debug_file.lower()
-            skipcount += 1
-        sf.close()
-    except IOError:
-        pass
-    log.debug('Skiplist contains %d items' % skipcount)
+    symbol_path = mkdtemp("symsrvfetch")
+    temp_path = mkdtemp(prefix="symcache")
 
-    modules = defaultdict(set)
-    missing_symbols = fetch_missing_symbols(args.missing_symbols)
+    modules, stats_collect = retry_run(collect, modules)
+    modules = retry_run(fetch_all, temp_path, modules)
 
-    lines = iter(missing_symbols.splitlines())
-    # Skip header
-    next(lines)
-    for line in lines:
-        line = line.rstrip().encode('ascii', 'replace')
-        bits = line.split(',')
-        if len(bits) < 2:
-            continue
-        pdb, uuid = bits[:2]
-        code_file, code_id = None, None
-        if len(bits) >= 4:
-            code_file, code_id = bits[2:4]
-        if pdb and uuid and pdb.endswith('.pdb'):
-            modules[pdb].add((uuid, code_file, code_id))
+    file_index, stats_dump = dump(symbol_path, temp_path, modules, args.dump_syms)
 
-    symbol_path = mkdtemp('symsrvfetch')
-    temp_path = mkdtemp(prefix='symtmp')
+    gen_zip(args.zip, symbol_path, file_index)
 
-    log.debug("Fetching symbols (%d pdb files)" % len(modules))
-    total = sum(len(ids) for ids in modules.values())
-    current = 0
-    blacklist_count = 0
-    skiplist_count = 0
-    existing_count = 0
-    not_found_count = 0
-    not_processed_count = 0
-    file_index = set()
-    # Now try to fetch all the unknown modules from the symbol server
-    for filename, ids in modules.iteritems():
-        if timed_out(start):
-            break
-        if filename.lower() in blacklist:
-            # This is one of our our debug files from Firefox/Thunderbird/etc
-            current += len(ids)
-            blacklist_count += len(ids)
-            continue
-        for (id, code_file, code_id) in ids:
-            if timed_out(start):
-                break
-            current += 1
-            if verbose:
-                sys.stdout.write('[%6d/%6d] %3d%% %-20s\r' %
-                                 (current, total, int(100 *
-                                                      current /
-                                                      total), filename[:20]))
-            if id in skiplist and skiplist[id] == filename.lower():
-                # We've asked the symbol server previously about this,
-                # so skip it.
-                log.debug('%s/%s already in skiplist', filename, id)
-                skiplist_count += 1
-                continue
-            rel_path = os.path.join(filename, id,
-                                    filename.replace('.pdb', '') + '.sym')
-            key = rel_path.replace('\\', '/')
-            if server_has_file(rel_path) or key in file_index:
-                log.debug('%s/%s already on server', filename, id)
-                existing_count += 1
-                continue
-            # Not in the blacklist, skiplist, and we don't already have it, so
-            # ask the symbol server for it.
-            try:
-                sym_output = fetch_and_dump_symbols(temp_path,
-                                                    id, filename,
-                                                    code_id, code_file)
-                if sym_output is None:
-                    not_found_count += 1
-                    # Figure out how to manage the skiplist later...
-                    log.debug(
-                        'Couldn\'t fetch %s/%s, but not skiplisting',
-                        filename,
-                        id)
-                else:
-                    log.debug('Successfully downloaded %s/%s', filename, id)
-                    file_index.add(key)
-                    sym_file = os.path.join(symbol_path, rel_path)
-                    try:
-                        os.makedirs(os.path.dirname(sym_file))
-                    except OSError:
-                        pass
-                    # TODO: just add to in-memory zipfile
-                    open(sym_file, 'w').write(sym_output)
-            except Win64ProcessError:
-                log.warn('Skipping Win64 PDB: %s/%s' % (filename, id))
-                not_processed_count += 1
-
-    if verbose:
-        sys.stdout.write('\n')
+    shutil.rmtree(symbol_path, True)
+    shutil.rmtree(temp_path, True)
 
     if not file_index:
         log.info(
-            'No symbols downloaded: %d considered, '
-            '%d already present, %d in blacklist, %d skipped, %d not found, '
-            '%d not processed ' %
-            (total,
-             existing_count,
-             blacklist_count,
-             skiplist_count,
-             not_found_count,
-             not_processed_count))
+            f"No symbols downloaded: {total} considered, "
+            f"{stats_collect['is_there']} already present, {stats_skipped['blacklist']} in blacklist, {stats_skipped['skiplist']} skipped, {stats_collect['no_pdb']} not found, "
+            f"{stats_dump['dump_error']} not processed"
+        )
+
         write_skiplist(skiplist)
         sys.exit(0)
 
-    # Write an index file
-    with zipfile.ZipFile(args.zip, 'w', zipfile.ZIP_DEFLATED) as z:
-        for f in file_index:
-            z.write(os.path.join(symbol_path, f), f)
-    log.info('Wrote zip as %s' % args.zip)
-
-    shutil.rmtree(symbol_path, True)
-
     # Write out our new skip list
     write_skiplist(skiplist)
-    log.info('Stored %d symbol files' % len(file_index))
-    log.info('Finished, exiting')
+    log.info(f"Stored {len(file_index)} symbol files")
+    log.info("Finished, exiting")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
