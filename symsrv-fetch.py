@@ -51,6 +51,7 @@ MISSING_SYMBOLS_URL = "https://symbols.mozilla.org/missingsymbols.csv?microsoft=
 HEADERS = {"User-Agent": USER_AGENT}
 SYM_SRV = "SRV*{}*https://msdl.microsoft.com/download/symbols"
 TIMEOUT = 7200
+RETRIES = 10
 
 
 log = logging.getLogger()
@@ -78,7 +79,7 @@ async def server_has_file(client, server, filename):
     Send the symbol server a HEAD request to see if it has this symbol file.
     """
     url = urljoin(server, quote(filename))
-    for _ in range(10):
+    for _ in range(RETRIES):
         try:
             async with client.head(url, headers=HEADERS, allow_redirects=True) as resp:
                 if resp.status == 200 and (
@@ -107,7 +108,7 @@ async def fetch_file(client, server, filename):
     """
     url = urljoin(server, quote(filename))
     log.debug(f"Fetch url: {url}")
-    for _ in range(10):
+    for _ in range(RETRIES):
         try:
             async with client.get(url, headers=HEADERS, allow_redirects=True) as resp:
                 if resp.status == 200:
@@ -413,7 +414,7 @@ def gen_zip(output, output_dir, file_index):
 
 
 def retry_run(cmd, *arg):
-    for _ in range(5):
+    for _ in range(RETRIES // 2):
         try:
             return cmd(*arg)
         except OSError as e:
