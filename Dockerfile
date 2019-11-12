@@ -13,8 +13,7 @@ RUN apt-get update \
     && apt-get remove -y wget \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
-    && python -m pip uninstall pip -y \
-    && rm requirements.txt
+    && python -m pip uninstall pip -y
 
 ENV DUMP_SYMS_PATH /home/user/dump_syms/dump_syms-linux-x86_64/dump_syms
 
