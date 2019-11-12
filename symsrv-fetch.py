@@ -94,6 +94,7 @@ async def server_has_file(client, server, filename):
                 else:
                     return False
         except Exception as e:
+            # Sometimes we've SSL errors or disconnections... so in such a situation just retry
             log.debug(f"Error with {url}: retry")
             log.exception(e)
             await asyncio.sleep(0.5)
