@@ -95,11 +95,11 @@ async def server_has_file(client, server, filename):
                     return False
         except Exception as e:
             # Sometimes we've SSL errors or disconnections... so in such a situation just retry
-            log.debug(f"Error with {url}: retry")
+            log.warning(f"Error with {url}: retry")
             log.exception(e)
             await asyncio.sleep(0.5)
 
-    log.debug(f"Too much retries (HEAD) for {url}: give up.")
+    log.debug(f"Too many retries (HEAD) for {url}: give up.")
     return False
 
 
@@ -127,18 +127,19 @@ async def fetch_file(client, server, filename):
                 else:
                     log.error(f"Cannot get data (status {resp.status}) for {url}: ")
         except Exception as e:
-            log.debug(f"Error with {url}")
+            log.warning(f"Error with {url}")
             log.exception(e)
             await asyncio.sleep(0.5)
 
-    log.debug(f"Too much retries (GET) for {url}: give up.")
+    log.debug(f"Too many retries (GET) for {url}: give up.")
     return None
 
 
 def write_skiplist(skiplist):
     with open("skiplist.txt", "w") as sf:
-        for (debug_id, debug_file) in skiplist.items():
-            sf.write("%s %s\n" % (debug_id, debug_file))
+        sf.writelines(
+            f"{debug_id} {debug_file}\n" for debug_id, debug_file in skiplist.items()
+        )
 
 
 async def fetch_missing_symbols(u):
@@ -150,21 +151,20 @@ async def fetch_missing_symbols(u):
             return data.splitlines()[1:]
 
 
-async def get_list(filename, info):
+async def get_list(filename):
     alist = set()
     if os.path.exists(filename):
         async with AIOFile(filename, "r") as In:
             async for line in LineReader(In):
                 line = line.rstrip()
                 alist.add(line)
-    log.debug(f"{info} contains {len(alist)} items")
+    log.debug(f"{filename} contains {len(alist)} items")
 
     return alist
 
 
 async def get_skiplist():
     skiplist = {}
-    skipcount = 0
     path = "skiplist.txt"
     if os.path.exists(path):
         async with AIOFile(path, "r") as In:
@@ -172,13 +172,12 @@ async def get_skiplist():
                 line = line.strip()
                 if line == "":
                     continue
-                s = line.split(None, 1)
+                s = line.split(" ", maxsplit=1)
                 if len(s) != 2:
                     continue
                 debug_id, debug_file = s
                 skiplist[debug_id] = debug_file.lower()
-                skipcount += 1
-    log.debug(f"Skiplist contains {skipcount} items")
+    log.debug(f"{path} contains {len(skiplist)} items")
 
     return skiplist
 
@@ -217,22 +216,24 @@ async def collect_info(client, filename, debug_id, code_file, code_id):
 
     has_pdb = await server_has_file(client, MICROSOFT_SYMBOL_SERVER, pdb_path)
     has_code = is_there = False
-    if has_pdb and not await server_has_file(client, MOZILLA_SYMBOL_SERVER, sym_path):
-        has_code = await server_has_file(
-            client, MICROSOFT_SYMBOL_SERVER, f"{code_file}/{code_id}/{code_file}"
-        )
-    elif has_pdb:
-        # if the file is on moz sym server no need to do anything
-        is_there = True
-        has_pdb = False
+    if has_pdb:
+        if not await server_has_file(client, MOZILLA_SYMBOL_SERVER, sym_path):
+            has_code = await server_has_file(
+                client, MICROSOFT_SYMBOL_SERVER, f"{code_file}/{code_id}/{code_file}"
+            )
+        else:
+            # if the file is on moz sym server no need to do anything
+            is_there = True
+            has_pdb = False
 
     return (filename, debug_id, code_file, code_id, has_pdb, has_code, is_there)
 
 
 async def check_x86_file(path):
     async with AIOFile(path, "rb") as In:
-        chunk = await In.read(32)
-        if chunk.startswith(b"MODULE windows x86 "):
+        head = b"MODULE windows x86 "
+        chunk = await In.read(len(head))
+        if chunk == head:
             return True
     return False
 
@@ -250,7 +251,7 @@ async def run_command(cmd):
 async def dump_module(
     output, symcache, filename, debug_id, code_file, code_id, has_code, dump_syms
 ):
-    sym_path = os.path.join(filename, debug_id, filename.replace(".pdb", "") + ".sym")
+    sym_path = os.path.join(filename, debug_id, filename.replace(".pdb", ".sym"))
     output_path = os.path.join(output, sym_path)
     sym_srv = SYM_SRV.format(symcache)
 
@@ -267,6 +268,9 @@ async def dump_module(
         return 1
 
     if not has_code and not await check_x86_file(output_path):
+        # PDB for 32 bits contains everything we need (symbols + stack unwind info)
+        # But PDB for 64 bits don't contain stack unwind info (they're in the binary (.dll/.exe) itself).
+        # So here we're logging because we've a PDB (64 bits) without its DLL/EXE
         log.debug(f"x86_64 binary {code_file}/{code_id} required")
         return 2
 
@@ -274,7 +278,7 @@ async def dump_module(
     return sym_path
 
 
-async def dump_helper(output, symcache, modules, dump_syms):
+async def dump(output, symcache, modules, dump_syms):
     tasks = []
     for filename, debug_id, code_file, code_id, has_code in modules:
         tasks.append(
@@ -290,11 +294,7 @@ async def dump_helper(output, symcache, modules, dump_syms):
             )
         )
 
-    return await asyncio.gather(*tasks)
-
-
-def dump(output, symcache, modules, dump_syms):
-    res = asyncio.run(dump_helper(output, symcache, modules, dump_syms))
+    res = await asyncio.gather(*tasks)
     file_index = {x for x in res if isinstance(x, str)}
     stats = {
         "dump_error": sum(1 for x in res if x == 1),
@@ -304,7 +304,7 @@ def dump(output, symcache, modules, dump_syms):
     return file_index, stats
 
 
-async def collect_helper(modules):
+async def collect(modules):
     loop = asyncio.get_event_loop()
     tasks = []
     connector = TCPConnector(limit=100, limit_per_host=20)
@@ -317,11 +317,7 @@ async def collect_helper(modules):
                     collect_info(client, filename, debug_id, code_file, code_id)
                 )
 
-        return await asyncio.gather(*tasks)
-
-
-def collect(modules):
-    res = asyncio.run(collect_helper(modules))
+        res = await asyncio.gather(*tasks)
     to_dump = []
     stats = {"no_pdb": 0, "is_there": 0}
     for filename, debug_id, code_file, code_id, has_pdb, has_code, is_there in res:
@@ -351,8 +347,7 @@ async def fetch_and_write(output, client, filename, file_id):
         return False
 
     output_dir = os.path.join(output, filename, file_id)
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     output_path = os.path.join(output_dir, filename)
     async with AIOFile(output_path, "wb") as Out:
@@ -361,9 +356,10 @@ async def fetch_and_write(output, client, filename, file_id):
     return True
 
 
-async def fetch_all_helper(output, modules):
+async def fetch_all(output, modules):
     loop = asyncio.get_event_loop()
     tasks = []
+    fetched_modules = []
     connector = TCPConnector(limit=100, limit_per_host=20)
     async with ClientSession(
         loop=loop, timeout=ClientTimeout(total=TIMEOUT), connector=connector
@@ -373,19 +369,17 @@ async def fetch_all_helper(output, modules):
             if has_code:
                 tasks.append(fetch_and_write(output, client, code_file, code_id))
 
-        return await asyncio.gather(*tasks)
+        res = await asyncio.gather(*tasks)
+        res = iter(res)
+        for filename, debug_id, code_file, code_id, has_code in modules:
+            fetched_pdb = next(res)
+            if has_code:
+                has_code = next(res)
+            if fetched_pdb:
+                fetched_modules.append(
+                    (filename, debug_id, code_file, code_id, has_code)
+                )
 
-
-def fetch_all(output, modules):
-    res = asyncio.run(fetch_all_helper(output, modules))
-    res = iter(res)
-    fetched_modules = []
-    for filename, debug_id, code_file, code_id, has_code in modules:
-        fetched_pdb = next(res)
-        if has_code:
-            has_code = next(res)
-        if fetched_pdb:
-            fetched_modules.append((filename, debug_id, code_file, code_id, has_code))
     return fetched_modules
 
 
@@ -394,9 +388,9 @@ def get_base_data(url):
         return await asyncio.gather(
             fetch_missing_symbols(url),
             # Symbols that we know belong to us, so don't ask Microsoft for them.
-            get_list("blacklist.txt", "Blacklist"),
+            get_list("blacklist.txt"),
             # Symbols that we know belong to Microsoft, so don't skiplist them.
-            get_list("known-microsoft-symbols.txt", "Known Microsoft symbols"),
+            get_list("known-microsoft-symbols.txt"),
             # Symbols that we've asked for in the past unsuccessfully
             get_skiplist(),
         )
@@ -417,7 +411,7 @@ def gen_zip(output, output_dir, file_index):
 def retry_run(cmd, *arg):
     for _ in range(RETRIES // 2):
         try:
-            return cmd(*arg)
+            return asyncio.run(cmd(*arg))
         except OSError as e:
             # Sometimes for any reasons we've "Too much open files"
             # So wait and try again
@@ -465,7 +459,9 @@ def main():
     modules, stats_collect = retry_run(collect, modules)
     modules = retry_run(fetch_all, temp_path, modules)
 
-    file_index, stats_dump = dump(symbol_path, temp_path, modules, args.dump_syms)
+    file_index, stats_dump = asyncio.run(
+        dump(symbol_path, temp_path, modules, args.dump_syms)
+    )
 
     gen_zip(args.zip, symbol_path, file_index)
 
