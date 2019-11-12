@@ -438,7 +438,7 @@ def main():
 
     logging.basicConfig(level=logging.DEBUG)
     aiohttp_logger = logging.getLogger("aiohttp.client")
-    aiohttp_logger.setLevel(logging.DEBUG)
+    aiohttp_logger.setLevel(logging.INFO)
     log.info("Started")
 
     missing_symbols, blacklist, known_ms_symbols, skiplist = get_base_data(
