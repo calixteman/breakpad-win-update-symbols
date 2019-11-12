@@ -449,7 +449,7 @@ def main():
 
     args = parser.parse_args()
 
-    assert bool(args.dump_syms), "dump_syms path is empty"
+    assert args.dump_syms, "dump_syms path is empty"
 
     logging.basicConfig(level=logging.DEBUG)
     aiohttp_logger = logging.getLogger("aiohttp.client")
