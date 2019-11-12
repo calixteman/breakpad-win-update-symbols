@@ -52,7 +52,7 @@ HEADERS = {"User-Agent": USER_AGENT}
 SYM_SRV = "SRV*{}*https://msdl.microsoft.com/download/symbols"
 TIMEOUT = 7200
 
-thisdir = os.path.dirname(__file__)
+
 log = logging.getLogger()
 
 
@@ -134,7 +134,7 @@ async def fetch_file(client, server, filename):
 
 
 def write_skiplist(skiplist):
-    with open(os.path.join(thisdir, "skiplist.txt"), "w") as sf:
+    with open("skiplist.txt", "w") as sf:
         for (debug_id, debug_file) in skiplist.items():
             sf.write("%s %s\n" % (debug_id, debug_file))
 
@@ -150,9 +150,8 @@ async def fetch_missing_symbols(u):
 
 async def get_list(filename, info):
     alist = set()
-    path = os.path.join(thisdir, filename)
-    if os.path.exists(path):
-        async with AIOFile(os.path.join(thisdir, filename), "r") as In:
+    if os.path.exists(filename):
+        async with AIOFile(filename, "r") as In:
             async for line in LineReader(In):
                 line = line.rstrip()
                 alist.add(line)
@@ -164,7 +163,7 @@ async def get_list(filename, info):
 async def get_skiplist():
     skiplist = {}
     skipcount = 0
-    path = os.path.join(thisdir, "skiplist.txt")
+    path = "skiplist.txt"
     if os.path.exists(path):
         async with AIOFile(path, "r") as In:
             async for line in LineReader(In):
