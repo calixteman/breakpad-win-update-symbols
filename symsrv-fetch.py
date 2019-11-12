@@ -224,8 +224,14 @@ async def collect_info(client, filename, debug_id, code_file, code_id):
     has_code = is_there = False
     if has_pdb:
         if not await server_has_file(client, MOZILLA_SYMBOL_SERVER, sym_path):
-            has_code = await server_has_file(
-                client, MICROSOFT_SYMBOL_SERVER, f"{code_file}/{code_id}/{code_file}"
+            has_code = (
+                code_file
+                and code_id
+                and await server_has_file(
+                    client,
+                    MICROSOFT_SYMBOL_SERVER,
+                    f"{code_file}/{code_id}/{code_file}",
+                )
             )
         else:
             # if the file is on moz sym server no need to do anything
@@ -277,7 +283,10 @@ async def dump_module(
         # PDB for 32 bits contains everything we need (symbols + stack unwind info)
         # But PDB for 64 bits don't contain stack unwind info (they're in the binary (.dll/.exe) itself).
         # So here we're logging because we've a PDB (64 bits) without its DLL/EXE
-        log.debug(f"x86_64 binary {code_file}/{code_id} required")
+        if code_file and code_id:
+            log.debug(f"x86_64 binary {code_file}/{code_id} required")
+        else:
+            log.debug(f"x86_64 binary for {filename}/{debug_id} required")
         return 2
 
     log.info(f"Successfully dumped: {filename}/{debug_id}")
@@ -461,7 +470,6 @@ def main():
     )
 
     modules, stats_skipped = get_missing_symbols(missing_symbols, skiplist, blacklist)
-    total = len(modules) + stats_skipped["blacklist"] + stats_skipped["skiplist"]
 
     symbol_path = mkdtemp("symsrvfetch")
     temp_path = mkdtemp(prefix="symcache")
@@ -478,19 +486,19 @@ def main():
     shutil.rmtree(symbol_path, True)
     shutil.rmtree(temp_path, True)
 
+    write_skiplist(skiplist)
+
     if not file_index:
+        log.info(f"No symbols downloaded: {len(missing_symbols)} considered")
+    else:
         log.info(
-            f"No symbols downloaded: {total} considered, "
-            f"{stats_collect['is_there']} already present, {stats_skipped['blacklist']} in blacklist, {stats_skipped['skiplist']} skipped, {stats_collect['no_pdb']} not found, "
-            f"{stats_dump['dump_error']} not processed"
+            f"Total files: {len(missing_symbols)}, Stored {len(file_index)} symbol files"
         )
 
-        write_skiplist(skiplist)
-        sys.exit(0)
-
-    # Write out our new skip list
-    write_skiplist(skiplist)
-    log.info(f"Stored {len(file_index)} symbol files")
+    log.info(
+        f"{stats_collect['is_there']} already present, {stats_skipped['blacklist']} in blacklist, {stats_skipped['skiplist']} skipped, {stats_collect['no_pdb']} not found, "
+        f"{stats_dump['dump_error']} processed with errors, {stats_dump['no_bin']} processed but with no binaries (x86_64)"
+    )
     log.info("Finished, exiting")
 
 
