@@ -32,7 +32,6 @@ import asyncio
 import sys
 import os
 import shutil
-import time
 import logging
 from collections import defaultdict
 from tempfile import mkdtemp
