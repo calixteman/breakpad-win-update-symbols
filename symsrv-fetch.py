@@ -50,7 +50,7 @@ MISSING_SYMBOLS_URL = "https://symbols.mozilla.org/missingsymbols.csv?microsoft=
 HEADERS = {"User-Agent": USER_AGENT}
 SYM_SRV = "SRV*{}*https://msdl.microsoft.com/download/symbols"
 TIMEOUT = 7200
-RETRIES = 10
+RETRIES = 5
 
 
 log = logging.getLogger()
@@ -73,12 +73,16 @@ def get_type(data):
     return "unknown"
 
 
+async def exp_backoff(retry_num):
+    await asyncio.sleep(2 ** retry_num)
+
+
 async def server_has_file(client, server, filename):
     """
     Send the symbol server a HEAD request to see if it has this symbol file.
     """
     url = urljoin(server, quote(filename))
-    for _ in range(RETRIES):
+    for i in range(RETRIES):
         try:
             async with client.head(url, headers=HEADERS, allow_redirects=True) as resp:
                 if resp.status == 200 and (
@@ -96,7 +100,7 @@ async def server_has_file(client, server, filename):
             # Sometimes we've SSL errors or disconnections... so in such a situation just retry
             log.warning(f"Error with {url}: retry")
             log.exception(e)
-            await asyncio.sleep(0.5)
+            await exp_backoff(i)
 
     log.debug(f"Too many retries (HEAD) for {url}: give up.")
     return False
@@ -108,7 +112,7 @@ async def fetch_file(client, server, filename):
     """
     url = urljoin(server, quote(filename))
     log.debug(f"Fetch url: {url}")
-    for _ in range(RETRIES):
+    for i in range(RETRIES):
         try:
             async with client.get(url, headers=HEADERS, allow_redirects=True) as resp:
                 if resp.status == 200:
@@ -116,7 +120,7 @@ async def fetch_file(client, server, filename):
                     typ = get_type(data)
                     if typ == "unknown":
                         # try again
-                        await asyncio.sleep(0.5)
+                        await exp_backoff(i)
                     elif typ == "pdb-v2":
                         # too old: skip it
                         log.debug(f"PDB v2 (skipped because too old): {url}")
@@ -322,7 +326,7 @@ async def collect(modules):
     loop = asyncio.get_event_loop()
     tasks = []
 
-    # In case of errors (Too much open files), just change limit_per_host
+    # In case of errors (Too many open files), just change limit_per_host
     connector = TCPConnector(limit=100, limit_per_host=0)
 
     async with ClientSession(
@@ -387,7 +391,7 @@ async def fetch_all(output, modules):
     tasks = []
     fetched_modules = []
 
-    # In case of errors (Too much open files), just change limit_per_host
+    # In case of errors (Too many open files), just change limit_per_host
     connector = TCPConnector(limit=100, limit_per_host=0)
 
     async with ClientSession(
