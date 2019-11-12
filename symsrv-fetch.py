@@ -307,7 +307,10 @@ async def dump(output, symcache, modules, dump_syms):
 async def collect(modules):
     loop = asyncio.get_event_loop()
     tasks = []
-    connector = TCPConnector(limit=100, limit_per_host=20)
+
+    # In case of errors (Too much open files), just change limit_per_host
+    connector = TCPConnector(limit=100, limit_per_host=0)
+
     async with ClientSession(
         loop=loop, timeout=ClientTimeout(total=TIMEOUT), connector=connector
     ) as client:
@@ -360,7 +363,10 @@ async def fetch_all(output, modules):
     loop = asyncio.get_event_loop()
     tasks = []
     fetched_modules = []
-    connector = TCPConnector(limit=100, limit_per_host=20)
+
+    # In case of errors (Too much open files), just change limit_per_host
+    connector = TCPConnector(limit=100, limit_per_host=0)
+
     async with ClientSession(
         loop=loop, timeout=ClientTimeout(total=TIMEOUT), connector=connector
     ) as client:
@@ -408,17 +414,6 @@ def gen_zip(output, output_dir, file_index):
     log.info(f"Wrote zip as {output}")
 
 
-def retry_run(cmd, *arg):
-    for _ in range(RETRIES // 2):
-        try:
-            return asyncio.run(cmd(*arg))
-        except OSError as e:
-            # Sometimes for any reasons we've "Too much open files"
-            # So wait and try again
-            log.exception(e)
-            time.sleep(10)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Fetch missing symbols from Microsoft symbol server"
@@ -456,8 +451,8 @@ def main():
     symbol_path = mkdtemp("symsrvfetch")
     temp_path = mkdtemp(prefix="symcache")
 
-    modules, stats_collect = retry_run(collect, modules)
-    modules = retry_run(fetch_all, temp_path, modules)
+    modules, stats_collect = asyncio.run(collect(modules))
+    modules = asyncio.run(fetch_all(temp_path, modules))
 
     file_index, stats_dump = asyncio.run(
         dump(symbol_path, temp_path, modules, args.dump_syms)
