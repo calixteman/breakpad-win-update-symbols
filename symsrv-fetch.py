@@ -153,11 +153,14 @@ async def fetch_missing_symbols(u):
 
 async def get_list(filename):
     alist = set()
-    if os.path.exists(filename):
+    try:
         async with AIOFile(filename, "r") as In:
             async for line in LineReader(In):
                 line = line.rstrip()
                 alist.add(line)
+    except FileNotFoundError:
+        pass
+
     log.debug(f"{filename} contains {len(alist)} items")
 
     return alist
@@ -166,7 +169,7 @@ async def get_list(filename):
 async def get_skiplist():
     skiplist = {}
     path = "skiplist.txt"
-    if os.path.exists(path):
+    try:
         async with AIOFile(path, "r") as In:
             async for line in LineReader(In):
                 line = line.strip()
@@ -177,6 +180,9 @@ async def get_skiplist():
                     continue
                 debug_id, debug_file = s
                 skiplist[debug_id] = debug_file.lower()
+    except FileNotFoundError:
+        pass
+
     log.debug(f"{path} contains {len(skiplist)} items")
 
     return skiplist
@@ -342,6 +348,15 @@ async def collect(modules):
     return to_dump, stats
 
 
+async def make_dirs(path):
+    loop = asyncio.get_event_loop()
+
+    def helper(path):
+        os.makedirs(path, exist_ok=True)
+
+    await loop.run_in_executor(None, helper, path)
+
+
 async def fetch_and_write(output, client, filename, file_id):
     path = os.path.join(filename, file_id, filename)
     data = await fetch_file(client, MICROSOFT_SYMBOL_SERVER, path)
@@ -350,7 +365,7 @@ async def fetch_and_write(output, client, filename, file_id):
         return False
 
     output_dir = os.path.join(output, filename, file_id)
-    os.makedirs(output_dir, exist_ok=True)
+    await make_dirs(output_dir)
 
     output_path = os.path.join(output_dir, filename)
     async with AIOFile(output_path, "wb") as Out:
